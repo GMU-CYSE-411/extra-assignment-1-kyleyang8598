@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const express = require("express");
 const cookieParser = require("cookie-parser");
+const crypto = require("crypto");
 const { DEFAULT_DB_FILE, openDatabase } = require("../db");
 
 function sendPublicFile(response, fileName) {
@@ -9,7 +10,11 @@ function sendPublicFile(response, fileName) {
 }
 
 function createSessionId() {
-  return `SESSION-${Math.random().toString(36).slice(2, 10)}-${Date.now()}`;
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function createCsrfToken() {
+  return crypto.randomBytes(24).toString("hex");
 }
 
 async function createApp() {
@@ -33,14 +38,15 @@ async function createApp() {
 
     if (!sessionId) {
       request.currentUser = null;
-      next();
-      return;
+      request.csrfToken = null;
+      return next();
     }
 
     const row = await db.get(
       `
         SELECT
           sessions.id AS session_id,
+          sessions.csrf_token AS csrf_token,
           users.id AS id,
           users.username AS username,
           users.role AS role,
@@ -52,25 +58,45 @@ async function createApp() {
       [sessionId]
     );
 
-    request.currentUser = row
-      ? {
+    if (!row) {
+      request.currentUser = null;
+      request.csrfToken = null;
+      return next();
+    }
+
+    request.currentUser = {
           sessionId: row.session_id,
           id: row.id,
           username: row.username,
           role: row.role,
           displayName: row.display_name
-        }
-      : null;
+        };
+
+    request.csrfToken = row.csrf_token;
 
     next();
   });
 
   function requireAuth(request, response, next) {
     if (!request.currentUser) {
-      response.status(401).json({ error: "Authentication required." });
-      return;
+      return response.status(401).json({ error: "Authentication required." });
     }
 
+    next();
+  }
+
+  function requireAdmin(request, response, next) {
+    if (!request.currentUser || request.currentUser.role !== "admin") {
+      return response.status(403).json({ error: "Forbidden" });
+    }
+    next();
+  }
+
+  function verifyCsrf(request, response, next) {
+    const token = request.body.csrfToken;
+    if (!token || token !== request.csrfToken) {
+      return response.status(403).json({ error: "Invalid CSRF token" });
+    }
     next();
   }
 
@@ -81,34 +107,37 @@ async function createApp() {
   app.get("/admin", (_request, response) => sendPublicFile(response, "admin.html"));
 
   app.get("/api/me", (request, response) => {
-    response.json({ user: request.currentUser });
+    response.json({ user: request.currentUser, csrfToken: request.csrfToken });
   });
 
   app.post("/api/login", async (request, response) => {
     const username = String(request.body.username || "");
     const password = String(request.body.password || "");
 
-    const query = `
-      SELECT id, username, role, display_name
+    const user = await db.get(
+      `SELECT id, username, role, display_name
       FROM users
-      WHERE username = '${username}' AND password = '${password}'
-    `;
-    const user = await db.get(query);
+      WHERE username = ? AND password = ?`,
+      [username, password]
+    );
 
     if (!user) {
-      response.status(401).json({ error: "Invalid username or password." });
-      return;
+      return response.status(401).json({ error: "Invalid username or password." });
     }
 
-    const sessionId = request.cookies.sid || createSessionId();
+    const sessionId = createSessionId();
+    const csrfToken = createCsrfToken();
 
     await db.run("DELETE FROM sessions WHERE id = ?", [sessionId]);
     await db.run(
-      "INSERT INTO sessions (id, user_id, created_at) VALUES (?, ?, ?)",
-      [sessionId, user.id, new Date().toISOString()]
+      "INSERT INTO sessions (id, user_id, csrf_token, created_at) VALUES (?, ?, ?, ?)",
+      [sessionId, user.id, csrfToken, new Date().toISOString()]
     );
 
     response.cookie("sid", sessionId, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "Strict",
       path: "/"
     });
 
@@ -119,15 +148,13 @@ async function createApp() {
         username: user.username,
         role: user.role,
         displayName: user.display_name
-      }
+      },
+      csrfToken
     });
   });
 
-  app.post("/api/logout", async (request, response) => {
-    if (request.cookies.sid) {
-      await db.run("DELETE FROM sessions WHERE id = ?", [request.cookies.sid]);
-    }
-
+  app.post("/api/logout", requireAuth, verifyCsrf, async (request, response) => {
+    await db.run("DELETE FROM sessions WHERE id = ?", [request.currentUser.sessionId]);
     response.clearCookie("sid");
     response.json({ ok: true });
   });
@@ -136,7 +163,8 @@ async function createApp() {
     const ownerId = request.query.ownerId || request.currentUser.id;
     const search = request.query.search || "";
 
-    const notes = await db.all(`
+    const notes = await db.all(
+      `
       SELECT
         notes.id,
         notes.owner_id AS ownerId,
@@ -147,23 +175,24 @@ async function createApp() {
         notes.created_at AS createdAt
       FROM notes
       JOIN users ON users.id = notes.owner_id
-      WHERE notes.owner_id = ${ownerId}
-        AND (notes.title LIKE '%${search}%' OR notes.body LIKE '%${search}%')
+      WHERE notes.owner_id = ?
+      AND (notes.title LIKE ? OR notes.body LIKE ?)
       ORDER BY notes.pinned DESC, notes.id DESC
-    `);
+      `,
+      [request.currentUser.id, `%${search}%`, `%${search}%`]
+    );
 
     response.json({ notes });
   });
 
-  app.post("/api/notes", requireAuth, async (request, response) => {
-    const ownerId = Number(request.body.ownerId || request.currentUser.id);
+  app.post("/api/notes", requireAuth, verifyCsrf, async (request, response) => {
     const title = String(request.body.title || "");
     const body = String(request.body.body || "");
     const pinned = request.body.pinned ? 1 : 0;
 
     const result = await db.run(
       "INSERT INTO notes (owner_id, title, body, pinned, created_at) VALUES (?, ?, ?, ?, ?)",
-      [ownerId, title, body, pinned, new Date().toISOString()]
+      [request.currentUser.id, title, body, pinned, new Date().toISOString()]
     );
 
     response.status(201).json({
@@ -173,8 +202,6 @@ async function createApp() {
   });
 
   app.get("/api/settings", requireAuth, async (request, response) => {
-    const userId = Number(request.query.userId || request.currentUser.id);
-
     const settings = await db.get(
       `
         SELECT
@@ -189,30 +216,29 @@ async function createApp() {
         JOIN users ON users.id = settings.user_id
         WHERE settings.user_id = ?
       `,
-      [userId]
+      [request.currentUser.id]
     );
 
     response.json({ settings });
   });
 
-  app.post("/api/settings", requireAuth, async (request, response) => {
-    const userId = Number(request.body.userId || request.currentUser.id);
+  app.post("/api/settings", requireAuth, verifyCsrf, async (request, response) => {
     const displayName = String(request.body.displayName || "");
     const statusMessage = String(request.body.statusMessage || "");
     const theme = String(request.body.theme || "classic");
     const emailOptIn = request.body.emailOptIn ? 1 : 0;
 
-    await db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, userId]);
+    await db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, request.currentUser.id]);
     await db.run(
       "UPDATE settings SET status_message = ?, theme = ?, email_opt_in = ? WHERE user_id = ?",
-      [statusMessage, theme, emailOptIn, userId]
+      [statusMessage, theme, emailOptIn, request.currentUser.id]
     );
 
     response.json({ ok: true });
   });
 
-  app.get("/api/settings/toggle-email", requireAuth, async (request, response) => {
-    const enabled = request.query.enabled === "1" ? 1 : 0;
+  app.post("/api/settings/toggle-email", requireAuth, verifyCsrf, async (request, response) => {
+    const enabled = request.body.enabled ? 1 : 0;
 
     await db.run("UPDATE settings SET email_opt_in = ? WHERE user_id = ?", [
       enabled,
@@ -236,7 +262,7 @@ async function createApp() {
         COUNT(notes.id) AS noteCount
       FROM users
       LEFT JOIN notes ON notes.owner_id = users.id
-      GROUP BY users.id, users.username, users.role, users.display_name
+      GROUP BY users.id
       ORDER BY users.id
     `);
 

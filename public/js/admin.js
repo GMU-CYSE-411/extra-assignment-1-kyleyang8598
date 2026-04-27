@@ -9,10 +9,9 @@
 
     if (user.role !== "admin") {
       document.getElementById("admin-warning").textContent =
-        "The client says this is not your area, but the page still tries to load admin data.";
-    } else {
-      document.getElementById("admin-warning").textContent = "Authenticated as admin.";
-    }
+        "Access denied.";
+      return;
+  }
 
     const result = await api("/api/admin/users");
     document.getElementById("admin-users").innerHTML = result.users

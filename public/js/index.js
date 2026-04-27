@@ -4,7 +4,7 @@
     writeJson("session-box", user || { anonymous: true });
 
     if (!user || user.role !== "admin") {
-      document.getElementById("admin-link").style.opacity = "0.55";
+      document.getElementById("admin-link").style.display = "none";
     }
   } catch (error) {
     writeJson("session-box", { error: error.message });
